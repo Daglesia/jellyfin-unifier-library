@@ -6,6 +6,8 @@
 #   python audio.py input.mkv  [output_dir] [--reencode] [--normalize]
 #   python audio.py C:\Movies  [output_dir] [--reencode] [--normalize]
 
+import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -14,8 +16,11 @@ from config import find_ffmpeg, find_ffprobe
 
 VIDEO_EXTS = {".mkv", ".mp4", ".avi", ".mov", ".ts", ".m2ts", ".wmv"}
 
-# AAC re-encode quality — only used when --reencode is passed
-AAC_BITRATE = "192k"   # 128k=small  192k=good  256k=excellent
+# AAC re-encode quality — only used when --reencode or --normalize is passed
+AAC_BITRATE = "256k"   # 128k=small  192k=good  256k=excellent
+
+# loudnorm targets (EBU R128)
+LOUDNORM_TARGET = "I=-16:TP=-1.5:LRA=11"
 
 
 # ── Audio track inspection ───────────────────────────────────────────────────
@@ -58,6 +63,52 @@ def print_audio_info(path: Path, ffprobe: str) -> None:
               f"lang={t['language'] or '?'}  title={t['title'] or '?'}")
 
 
+# ── Two-pass loudnorm ────────────────────────────────────────────────────────
+
+def loudnorm_pass1(ffmpeg: str, path: Path) -> dict:
+    """
+    Pass 1: decode the first audio stream and let loudnorm measure its true
+    integrated loudness, true peak, and loudness range.  FFmpeg writes the
+    results as a JSON block to stderr.
+
+    Returns a dict with keys:
+        input_i, input_tp, input_lra, input_thresh, target_offset
+    """
+    print("  Analysing loudness (pass 1 / 2)...")
+    result = subprocess.run(
+        [ffmpeg, "-i", str(path),
+         "-map", "0:a:0",          # measure the first audio stream only
+         "-af", f"loudnorm={LOUDNORM_TARGET}:print_format=json",
+         "-f", "null", "-"],
+        capture_output=True, text=True,
+    )
+    # loudnorm always writes its JSON block to stderr
+    match = re.search(r'\{[^{}]+\}', result.stderr, re.DOTALL)
+    if not match:
+        raise RuntimeError(
+            f"loudnorm pass 1 produced no JSON output.\n"
+            f"stderr (last 2000 chars):\n{result.stderr[-2000:]}"
+        )
+    return json.loads(match.group())
+
+
+def build_loudnorm_filter(stats: dict) -> str:
+    """
+    Build the pass-2 loudnorm filter string, feeding in the exact measurements
+    from pass 1.  linear=true selects linear (gain-based) normalisation, which
+    preserves dynamics better than the default dynamic mode.
+    """
+    return (
+        f"loudnorm={LOUDNORM_TARGET}"
+        f":measured_I={stats['input_i']}"
+        f":measured_TP={stats['input_tp']}"
+        f":measured_LRA={stats['input_lra']}"
+        f":measured_thresh={stats['input_thresh']}"
+        f":offset={stats['target_offset']}"
+        f":linear=true"
+    )
+
+
 # ── Processing ───────────────────────────────────────────────────────────────
 
 def process_mkv(
@@ -83,27 +134,23 @@ def process_mkv(
            "-c:v", "copy",          # video: always stream-copy
            "-c:s", "copy"]          # subtitles: always stream-copy
 
-    if normalize and reencode:
-        # Normalize + re-encode: two-pass loudnorm
-        print(f"  Re-encoding audio → AAC {AAC_BITRATE} with loudnorm...")
-        cmd += [
-            "-c:a", "aac",
-            "-b:a", AAC_BITRATE,
-            "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
-        ]
-    elif normalize:
-        # Normalize only — must re-encode (can't normalize a copied stream)
-        print(f"  Re-encoding audio → AAC {AAC_BITRATE} with loudnorm (normalize implies re-encode)...")
-        cmd += [
-            "-c:a", "aac",
-            "-b:a", AAC_BITRATE,
-            "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
-        ]
+    if normalize:
+        # True two-pass loudnorm: pass 1 measures, pass 2 corrects precisely.
+        try:
+            stats = loudnorm_pass1(ffmpeg, mkv_path)
+        except RuntimeError as e:
+            print(f"  ✗ {e}\n")
+            return
+        af = build_loudnorm_filter(stats)
+        print(f"  Re-encoding audio → AAC {AAC_BITRATE} with two-pass loudnorm (pass 2 / 2)...")
+        cmd += ["-c:a", "aac", "-b:a", AAC_BITRATE, "-af", af]
+
     elif reencode:
-        # Re-encode without normalizing — useful to convert DTS/TrueHD for
+        # Re-encode without normalising — useful to convert DTS/TrueHD for
         # clients that can't decode them
         print(f"  Re-encoding audio → AAC {AAC_BITRATE} (no normalize)...")
         cmd += ["-c:a", "aac", "-b:a", AAC_BITRATE]
+
     else:
         # Default: stream-copy — zero quality loss
         print(f"  Audio: stream-copied (original codec preserved)")
@@ -136,7 +183,7 @@ def run(args: list[str]) -> None:
         print()
         print("  (no flags)    Stream-copy audio — zero quality loss (default)")
         print("  --reencode    Re-encode to AAC (for clients that can't play AC3/DTS)")
-        print("  --normalize   Re-encode + loudnorm volume levelling")
+        print("  --normalize   Re-encode + two-pass loudnorm volume levelling")
         print("  --info        Just print audio track info, no output file")
         sys.exit(0)
 
@@ -144,7 +191,7 @@ def run(args: list[str]) -> None:
     ffprobe = find_ffprobe()
 
     print(f"\n🔊 Audio utility")
-    print(f"   Mode   : {'info only' if info_only else 'normalize+reencode' if normalize else 'reencode AAC' if reencode else 'stream-copy (lossless)'}")
+    print(f"   Mode   : {'info only' if info_only else 'two-pass loudnorm' if normalize else 'reencode AAC' if reencode else 'stream-copy (lossless)'}")
     print(f"   ffmpeg : {ffmpeg}\n")
 
     input_path = Path(clean_args[0])
