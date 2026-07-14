@@ -9,7 +9,10 @@ FFMPEG_PATH  = r""
 FFPROBE_PATH = r""
 
 # Full path to your .otf or .ttf font file (used by the font utility)
-FONT_FILE = r""
+FONT_FILE = "./Rosario-Regular.ttf"
+
+SUBTITLE_TRACK_NAME = "Daglesia's Subuwutitles"
+# SUBTITLE_TRACK_NAME = "[DagSubs] Polish"
 
 # Video quality: CRF for libx265 (18=near-lossless, 22=great, 28=small)
 VIDEO_CRF = 22

@@ -17,7 +17,7 @@ from config import find_ffmpeg, find_ffprobe
 VIDEO_EXTS = {".mkv", ".mp4", ".avi", ".mov", ".ts", ".m2ts", ".wmv"}
 
 # AAC re-encode quality — only used when --reencode or --normalize is passed
-AAC_BITRATE = "256k"   # 128k=small  192k=good  256k=excellent
+AAC_BITRATE = "320k"   # 128k=small  192k=good  256k=excellent
 
 # loudnorm targets (EBU R128)
 LOUDNORM_TARGET = "I=-16:TP=-1.5:LRA=11"

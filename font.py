@@ -1,47 +1,82 @@
-# ── font.py — change subtitle font in MKV or standalone .srt/.ass files ─────
+# ── font.py ──────────────────────────────────────────────────────────────────
+# Change the primary subtitle font in MKV or standalone .srt/.ass files using MKVToolNix
 
 import re
 import subprocess
 import sys
 import shutil
 import tempfile
+import json
 from pathlib import Path
+from collections import Counter
 
-from config import find_ffmpeg, find_ffprobe, FONT_FILE
+# Safe configuration defaults
+FONT_FILE = "sub_font.ttf"
+FONT_NAME = None
+SUBTITLE_TRACK_NAME = None
+
+# Import defaults individually to prevent a partial config from breaking the script
+try:
+    import config
+    FONT_FILE = getattr(config, "FONT_FILE", FONT_FILE)
+    FONT_NAME = getattr(config, "FONT_NAME", FONT_NAME)
+    SUBTITLE_TRACK_NAME = getattr(config, "SUBTITLE_TRACK_NAME", SUBTITLE_TRACK_NAME)
+except ImportError:
+    pass  # Fall back smoothly to defaults if config.py is completely missing
 
 # ── Top-level constants ───────────────────────────────────────────────────────
-# Set FONT_NAME to the exact family name subtitle renderers will look up.
-# This must match nameID 1 inside the font file (e.g. "Noto Sans", "Arial").
-# If left as None, it is derived automatically from the font binary at startup.
-FONT_NAME: str | None = None   # e.g. "Noto Sans" — override here
+SUB_EXTS = {".srt", ".ass", ".ssa"}
+MKV_EXT = ".mkv"
 
-SUB_EXTS   = {".srt", ".ass", ".ssa"}
-MKV_EXT    = ".mkv"
-TEXT_CODECS = {"ass", "ssa", "subrip", "srt", "webvtt", "mov_text", "text"}
+# MKVMerge identification strings for text-based subtitle systems
+TEXT_CODECS = {"substationalpha", "subrip/srt", "webvtt", "text/utf8"}
 
 
-# ── Font name derivation ─────────────────────────────────────────────────────
+# ── Binary Finders (MKVToolNix) ──────────────────────────────────────────────
+
+def find_binary(name: str) -> str:
+    """Locate mkvmerge or mkvextract in system PATH or common installation slots."""
+    binary = shutil.which(name)
+    if binary:
+        return binary
+    
+    # Common local/OS paths if not exposed to global environments
+    common_paths = [
+        r"C:\Program Files\MKVToolNix",
+        r"C:\Program Files (x86)\MKVToolNix",
+        "/usr/bin",
+        "/usr/local/bin",
+        "/opt/homebrew/bin"
+    ]
+    suffix = ".exe" if sys.platform == "win32" else ""
+    for p in common_paths:
+        chk = Path(p) / f"{name}{suffix}"
+        if chk.exists():
+            return str(chk)
+            
+    print(f"✗ Dependency Missing: Could not find '{name}' binary.")
+    print("  Please install MKVToolNix and add it to your system PATH environment.")
+    sys.exit(1)
+
+
+# ── Font metadata inspection ─────────────────────────────────────────────────
 
 def get_font_name(font_file: Path) -> str:
-    """
-    Read the font family name from the file's internal name table (nameID 1).
-    This is the exact name subtitle renderers look up when honouring a
-    Fontname= reference — guessing it from the filename is unreliable and
-    will cause the embedded font to go unused.
-
-    Falls back to stripping weight suffixes from the filename if fonttools
-    is not installed  (pip install fonttools  to get the accurate behaviour).
-    """
+    """Read the layout engine font family name from nameID 1 table inside the binary."""
     try:
         from fontTools.ttLib import TTFont
         tt = TTFont(font_file)
-        for record in tt["name"].names:
-            if record.nameID == 1:          # Family name record
-                return record.toUnicode()
+        candidates = [r for r in tt["name"].names if r.nameID == 1]
+        windows = [r for r in candidates if r.platformID == 3]
+        if windows:
+            en_us = [r for r in windows if r.langID == 0x409]
+            return (en_us[0] if en_us else windows[0]).toUnicode()
+        if candidates:
+            return candidates[0].toUnicode()
     except Exception:
         pass
 
-    # Fallback: strip weight suffixes from filename
+    # Fallback parsing strategy using file stem structure adjustments
     stem = font_file.stem
     stem = re.sub(
         r"[-_](Regular|Bold|Italic|Light|Medium|Thin|Black|SemiBold|ExtraBold).*$",
@@ -50,106 +85,179 @@ def get_font_name(font_file: Path) -> str:
     return stem
 
 
-# ── HTML → ASS conversion helper ────────────────────────────────────────────
+# ── Advanced SubStation Alpha (ASS) Advanced Font Scanners ───────────────────
+
+def find_most_used_font(ass_path: Path) -> str | None:
+    """
+    Scans the ASS style layout rules and lines to map out font allocations,
+    tallying usage weight to safely spot the absolute dominant dialogue font.
+    """
+    content = ass_path.read_text(encoding="utf-8-sig", errors="replace")
+    styles = {}        # style_name -> font_name
+    style_counts = {}  # font_name -> cumulative text line assignments
+    style_format = []
+    
+    in_styles = False
+    in_events = False
+    
+    for line in content.splitlines():
+        line_strip = line.strip()
+        if not line_strip:
+            continue
+            
+        normalized = line_strip.lower()
+        if normalized == "[v4+ styles]":
+            in_styles = True; in_events = False; continue
+        elif normalized == "[events]":
+            in_events = True; in_styles = False; continue
+        elif normalized.startswith("[") and normalized.endswith("]"):
+            in_styles = False; in_events = False; continue
+            
+        if in_styles:
+            if line_strip.startswith("Format:"):
+                style_format = [f.strip().lower() for f in line_strip.split(":", 1)[1].split(",")]
+            elif line_strip.startswith("Style:"):
+                if not style_format:
+                    continue
+                parts = [p.strip() for p in line_strip.split(":", 1)[1].split(",")]
+                try:
+                    name_idx = style_format.index("name")
+                    font_idx = style_format.index("fontname")
+                    if name_idx < len(parts) and font_idx < len(parts):
+                        styles[parts[name_idx]] = parts[font_idx]
+                except ValueError:
+                    continue
+                    
+        elif in_events:
+            if line_strip.startswith("Dialogue:"):
+                parts = line_strip.split(",", 9)
+                if len(parts) >= 10:
+                    style_name = parts[3].strip()
+                    text_field = parts[9]
+                    
+                    # Target default font referenced directly via script style configurations
+                    base_font = styles.get(style_name)
+                    
+                    # Capture tag style adjustments manually added inline inside brackets (\fnFontName)
+                    inline_overrides = re.findall(r"\\fn([^}\\]+)", text_field)
+                    if inline_overrides:
+                        for font in inline_overrides:
+                            f_clean = font.strip()
+                            style_counts[f_clean] = style_counts.get(f_clean, 0) + 1
+                    elif base_font:
+                        style_counts[base_font] = style_counts.get(base_font, 0) + 1
+
+    if style_counts:
+        return max(style_counts, key=style_counts.get)
+    if styles:
+        return Counter(styles.values()).most_common(1)[0][0]
+    return None
+
+
+def replace_ass_font(ass_path: Path, font_name: str) -> str:
+    """Swaps out only the single most heavily used font name within the script target."""
+    old_font = find_most_used_font(ass_path)
+    content = ass_path.read_text(encoding="utf-8-sig", errors="replace")
+    
+    if not old_font:
+        print(f"  ⚠ Could not isolate a dominant font template. Skipping modifications.")
+        return content
+
+    print(f"  Targeted Replacement: Changing '{old_font}' → '{font_name}' (Other styles left intact)")
+
+    lines = content.splitlines()
+    style_format = []
+    out_lines = []
+    in_styles = False
+    
+    for line in lines:
+        line_strip = line.strip()
+        if line_strip.lower() == "[v4+ styles]":
+            in_styles = True
+            out_lines.append(line)
+            continue
+        elif line_strip.startswith("[") and line_strip.endswith("]"):
+            in_styles = False
+            out_lines.append(line)
+            continue
+            
+        if in_styles:
+            if line_strip.startswith("Format:"):
+                style_format = [f.strip().lower() for f in line_strip.split(":", 1)[1].split(",")]
+                out_lines.append(line)
+            elif line_strip.startswith("Style:"):
+                if style_format:
+                    prefix, rest = line.split(":", 1)
+                    parts = [p.strip() for p in rest.split(",")]
+                    try:
+                        font_idx = style_format.index("fontname")
+                        if font_idx < len(parts) and parts[font_idx].lower() == old_font.lower():
+                            parts[font_idx] = font_name
+                            out_lines.append(f"{prefix}: " + ",".join(parts))
+                        else:
+                            out_lines.append(line)
+                    except ValueError:
+                        out_lines.append(line)
+                else:
+                    out_lines.append(line)
+        else:
+            # Inline execution sweep matching specifically text instances matching old target layout structures
+            escaped_old = re.escape(old_font)
+            modified_line = re.sub(r"\\fn" + escaped_old + r"(?=[}\\])", f"\\\\fn{font_name}", line, flags=re.IGNORECASE)
+            out_lines.append(modified_line)
+            
+    return "\n".join(out_lines) + "\n"
+
+
+# ── HTML -> ASS String Conversion Helpers ────────────────────────────────────
 
 def html_to_ass(text: str) -> str:
-    """
-    Convert HTML formatting tags commonly found in SRT files into ASS override
-    codes.  Stripping them (as the original code did) silently removes all
-    italic and bold formatting from dialogue.
-
-    Any remaining tags (e.g. <font color=...>) that have no ASS equivalent
-    are stripped afterwards.
-    """
+    """Converts basic web formatting rules into structural ASS rendering markers."""
     for html_tag, ass_code in [
-        ("<i>",  "{\\i1}"), ("</i>", "{\\i0}"),
-        ("<b>",  "{\\b1}"), ("</b>", "{\\b0}"),
-        ("<u>",  "{\\u1}"), ("</u>", "{\\u0}"),
-        ("<s>",  "{\\s1}"), ("</s>", "{\\s0}"),
+        ("<i>", "{\\i1}"), ("</i>", "{\\i0}"),
+        ("<b>", "{\\b1}"), ("</b>", "{\\b0}"),
+        ("<u>", "{\\u1}"), ("</u>", "{\\u0}"),
+        ("<s>", "{\\s1}"), ("</s>", "{\\s0}"),
     ]:
-        # Handle both lower-case (<i>) and upper-case (<I>) variants
         text = text.replace(html_tag, ass_code).replace(html_tag.upper(), ass_code)
-
-    # Strip any remaining HTML tags
     return re.sub(r"<[^>]+>", "", text)
 
 
-# ── ASS conversion / font replacement ───────────────────────────────────────
-
 def srt_to_ass(srt_path: Path, font_name: str) -> str:
-    """Convert SRT → ASS, embedding the given font in the Style header."""
+    """Transforms structural SubRip data structures natively into ASS tables."""
     header = (
-        "[Script Info]\n"
-        "ScriptType: v4.00+\n"
-        "PlayResX: 1280\n"
-        "PlayResY: 720\n"
-        "\n"
-        "[V4+ Styles]\n"
-        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
-        "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, "
-        "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
-        "Alignment, MarginL, MarginR, MarginV, Encoding\n"
-        f"Style: Default,{font_name},52,&H00FFFFFF,&H000000FF,"
-        "&H00000000,&H80000000,0,0,0,0,100,100,0,0,1,2,1,2,10,10,24,1\n"
-        "\n"
-        "[Events]\n"
-        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+        "[Script Info]\nScriptType: v4.00+\nPlayResX: 1280\nPlayResY: 720\n\n"
+        "[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
+        "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, "
+        "Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
+        f"Style: Default,{font_name},52,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,0,0,0,0,100,100,0,0,1,2,1,2,10,10,24,1\n\n"
+        "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
     )
 
     def to_ass_time(t: str) -> str:
         t = t.replace(",", ".")
         h, m, rest = t.split(":")
         s, ms = rest.split(".")
-        # Round to centiseconds — truncating (ms[:2]) loses up to 9 ms per cue
-        cs = str(round(int(ms) / 10)).zfill(2)
+        cs = str(round(int(ms) / 10)).zfill(2)[:2]
         return f"{int(h)}:{m}:{s}.{cs}"
 
     lines_out = []
-    for block in re.split(r"\n\s*\n", srt_path.read_text(encoding="utf-8-sig", errors="replace").strip()):
+    blocks = re.split(r"\n\s*\n", srt_path.read_text(encoding="utf-8-sig", errors="replace").strip())
+    for block in blocks:
         lines = block.strip().splitlines()
         if len(lines) < 3:
             continue
         try:
             start, end = re.split(r"\s*-->\s*", lines[1])
             text = r"\N".join(lines[2:])
-            text = html_to_ass(text)           # convert, don't strip
-            lines_out.append(
-                f"Dialogue: 0,{to_ass_time(start.strip())},{to_ass_time(end.strip())},"
-                f"Default,,0,0,0,,{text}"
-            )
+            text = html_to_ass(text)
+            lines_out.append(f"Dialogue: 0,{to_ass_time(start.strip())},{to_ass_time(end.strip())},Default,,0,0,0,,{text}")
         except Exception:
             continue
-
     return header + "\n".join(lines_out) + "\n"
 
 
-def replace_ass_font(ass_path: Path, font_name: str) -> str:
-    """
-    Replace every Fontname value in an ASS/SSA file.
-
-    Two replacement sites:
-      1. Style: lines  —  "Style: Name,OldFont,size,..."
-      2. Inline \\fn override tags in Dialogue lines  —  {\\fnOldFont}
-         These are per-line overrides that take precedence over the Style block
-         and would cause the original font to bleed back in if left unchanged.
-    """
-    content = ass_path.read_text(encoding="utf-8-sig", errors="replace")
-
-    # 1. Style lines
-    content = re.sub(
-        r"^(Style:[^,]+),([^,]+),",
-        lambda m: f"{m.group(1)},{font_name},",
-        content,
-        flags=re.MULTILINE,
-    )
-
-    # 2. Inline \fn override tags: match \fn followed by anything up to } or \
-    content = re.sub(r"\\fn[^}\\]+", f"\\\\fn{font_name}", content)
-
-    return content
-
-
-# ── Standalone subtitle file ─────────────────────────────────────────────────
+# ── Main processing endpoints ───────────────────────────────────────────────
 
 def process_subtitle(sub_path: Path, output_dir: Path, font_name: str) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -157,224 +265,188 @@ def process_subtitle(sub_path: Path, output_dir: Path, font_name: str) -> Path:
     ext = sub_path.suffix.lower()
 
     if ext == ".srt":
-        print(f"  SRT → ASS  (font: {font_name})")
+        print(f"  SRT → ASS Conversion (font: {font_name})")
         content = srt_to_ass(sub_path, font_name)
     elif ext in (".ass", ".ssa"):
-        print(f"  Replacing font in ASS  (font: {font_name})")
+        print(f"  Parsing font mapping configuration patterns...")
         content = replace_ass_font(sub_path, font_name)
     else:
-        raise ValueError(f"Unsupported subtitle format: {ext}")
+        raise ValueError(f"Format profile unsupported: {ext}")
 
     out.write_text(content, encoding="utf-8")
-    print(f"  ✓ {out.name}\n")
+    print(f"  ✓ Written: {out.name}\n")
     return out
 
 
-# ── MKV subtitle track helpers ───────────────────────────────────────────────
-
-def get_subtitle_tracks(ffprobe: str, mkv_path: Path) -> list[dict]:
-    result = subprocess.run(
-        [ffprobe, "-v", "error",
-         "-select_streams", "s",
-         "-show_entries", "stream=index,codec_name:stream_tags=language,title",
-         "-of", "csv=p=0", str(mkv_path)],
-        capture_output=True, text=True,
-    )
-    tracks = []
-    for line in result.stdout.strip().splitlines():
-        if not line.strip():
-            continue
-        parts = line.split(",")
-        tracks.append({
-            "index":    parts[0] if len(parts) > 0 else "?",
-            "codec":    parts[1] if len(parts) > 1 else "unknown",
-            "language": parts[2] if len(parts) > 2 else "",
-            "title":    parts[3] if len(parts) > 3 else "",
-        })
-    return tracks
-
-
-def get_attachment_count(ffprobe: str, mkv_path: Path) -> int:
-    """Return the number of attachment streams already present in the file."""
-    result = subprocess.run(
-        [ffprobe, "-v", "error",
-         "-select_streams", "t",
-         "-show_entries", "stream=index",
-         "-of", "csv=p=0", str(mkv_path)],
-        capture_output=True, text=True,
-    )
-    return len([ln for ln in result.stdout.strip().splitlines() if ln.strip()])
-
-
-# ── MKV processing ───────────────────────────────────────────────────────────
-
 def process_mkv(mkv_path: Path, output_dir: Path, font_name: str, font_file: Path,
-                ffmpeg: str, ffprobe: str) -> None:
+                mkvmerge: str, mkvextract: str, track_name_override: str | None) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     out = output_dir / f"{mkv_path.stem}_new_font.mkv"
 
     if out.exists():
-        print(f"  ↷ Skipping (output exists): {out.name}\n")
+        print(f"  Skipping (Output file already initialized): {out.name}\n")
         return
 
-    tracks = get_subtitle_tracks(ffprobe, mkv_path)
-    if not tracks:
-        print(f"  ⚠ No subtitle tracks found — copying MKV as-is\n")
+    # Request track manifest extraction using json data maps
+    result = subprocess.run([mkvmerge, "-J", str(mkv_path)], capture_output=True, text=True, encoding="utf-8")
+    if result.returncode != 0:
+        print(f"  ✗ Identification failure on source target asset.")
+        return
+        
+    mkv_info = json.loads(result.stdout)
+    tracks = mkv_info.get("tracks", [])
+    
+    sub_tracks = []
+    for t in tracks:
+        if t.get("type") == "subtitles":
+            props = t.get("properties", {})
+            sub_tracks.append({
+                "id": t.get("id"),
+                "codec": t.get("codec", "unknown"),
+                "default": "1" if props.get("default_track") else "0",
+                "forced": "1" if props.get("forced_track") else "0",
+                "language": props.get("language", ""),
+                "title": props.get("track_name", ""),
+            })
+
+    if not sub_tracks:
+        print(f"  ⚠ Dynamic mapping empty of layout track text streams — duplicating standard container layout.\n")
         shutil.copy2(mkv_path, out)
         return
 
-    print(f"  Found {len(tracks)} subtitle track(s):")
-    for t in tracks:
-        action = "rewrite" if t["codec"].lower() in TEXT_CODECS else "copy (image-based)"
-        print(f"    [{t['index']}] {t['codec']:16s}  "
-              f"lang={t['language'] or '?'}  title={t['title'] or '?'}  → {action}")
+    print(f"  Discovered {len(sub_tracks)} subtitle element channels:")
+    for st in sub_tracks:
+        action = "rewrite" if st["codec"].lower() in TEXT_CODECS else "copy (image-based bitmap metadata)"
+        print(f"    [{st['id']}] {st['codec']:22s} lang={st['language'] or '?'} title={st['title'] or '?'} → {action}")
 
-    with tempfile.TemporaryDirectory() as _tmp:
-        tmp = Path(_tmp)
+    with tempfile.TemporaryDirectory() as temp_dir:
+        tmp = Path(temp_dir)
+        processed = []
+        processed_ids = set()
 
-        # processed   : [(track_dict, new_ass_path), ...]  — text tracks rewritten
-        # unprocessed : [track_dict, ...]                  — image tracks, failed extracts
-        processed:   list[tuple[dict, Path]] = []
-        unprocessed: list[dict]              = []
-
-        for track in tracks:
-            codec = track["codec"].lower()
-
-            if codec not in TEXT_CODECS:
-                # PGS, VOBSUB, etc. — can't rewrite, preserve as-is
-                unprocessed.append(track)
+        for st in sub_tracks:
+            codec_lower = st["codec"].lower()
+            if codec_lower not in TEXT_CODECS:
                 continue
 
-            src_ext = ".ass" if codec in ("ass", "ssa") else ".srt"
-            raw     = tmp / f"track_{track['index']}{src_ext}"
+            src_ext = ".ass" if "substationalpha" in codec_lower else ".srt"
+            raw_extracted = tmp / f"track_{st['id']}{src_ext}"
 
-            print(f"  Extracting [{track['index']}] ({codec})...")
+            print(f"  Extracting subtitle map stream [{st['id']}]...")
             subprocess.run(
-                [ffmpeg, "-y", "-i", str(mkv_path),
-                 "-map", f"0:{track['index']}", "-c:s", "copy", str(raw)],
-                capture_output=True, text=True,
+                [mkvextract, "tracks", str(mkv_path), f"{st['id']}:{str(raw_extracted)}"],
+                capture_output=True, text=True
             )
-            if not raw.exists() or raw.stat().st_size == 0:
-                print(f"    ⚠ Could not extract — preserving original")
-                unprocessed.append(track)
+
+            if not raw_extracted.exists() or raw_extracted.stat().st_size == 0:
+                print(f"    ⚠ Extraction profile blank — bypass rewriting on element thread.")
                 continue
 
-            new_ass = tmp / f"track_{track['index']}_new.ass"
-            content = (srt_to_ass(raw, font_name) if src_ext == ".srt"
-                       else replace_ass_font(raw, font_name))
-            new_ass.write_text(content, encoding="utf-8")
-            processed.append((track, new_ass))
+            rewritten_ass = tmp / f"track_{st['id']}_modified.ass"
+            content = (srt_to_ass(raw_extracted, font_name) if src_ext == ".srt" 
+                       else replace_ass_font(raw_extracted, font_name))
+            
+            rewritten_ass.write_text(content, encoding="utf-8")
+            processed.append((st, rewritten_ass))
+            processed_ids.add(st["id"])
 
         if not processed:
-            print("  ⚠ No text tracks could be processed\n")
+            print("  ⚠ Processing run mapping execution skipped: no compatible text assets modified.\n")
             return
 
-        # ── Build remux command ──────────────────────────────────────────────
-        #
-        # Input 0        = original MKV
-        # Inputs 1..N    = new ASS files, one per processed track, in the
-        #                  same order they appear in `processed`
-        #
-        # Subtitle tracks are mapped in their ORIGINAL order so that default
-        # track selection in players is not disturbed.  Image-based tracks
-        # (PGS/VOBSUB) and any text track that failed extraction are
-        # stream-copied from input 0 instead of being dropped.
+        # Build structural mapping chain definitions for MKVMerge engine remux execution
+        cmd = [mkvmerge, "-o", str(out)]
+        
+        # Calculate matching internal array identifiers to strip original lines out
+        remaining_subs = [str(st["id"]) for st in sub_tracks if st["id"] not in processed_ids]
+        if not remaining_subs:
+            cmd += ["-S"]  # Strip out original sub allocations safely
+        else:
+            cmd += ["-s", ",".join(remaining_subs)]
 
-        cmd = [ffmpeg, "-y", "-i", str(mkv_path)]
-        for _, new_ass in processed:
-            cmd += ["-i", str(new_ass)]
+        cmd += [str(mkv_path)]
 
-        # Video, audio, chapters from original
-        cmd += ["-map", "0:v", "-map", "0:a?", "-map_chapters", "0"]
-
-        # Build a lookup: track index → (ffmpeg input index, new_ass path)
-        processed_by_idx = {
-            t["index"]: (i + 1, p)
-            for i, (t, p) in enumerate(processed)
-        }
-
-        codec_args: list[str] = []
-        meta_args:  list[str] = []
-        out_sub_idx = 0
-
-        for track in tracks:
-            if track["index"] in processed_by_idx:
-                input_num, _ = processed_by_idx[track["index"]]
-                cmd        += ["-map", str(input_num)]
-                codec_args += [f"-c:s:{out_sub_idx}", "ass"]
-                if track["language"]:
-                    meta_args += [f"-metadata:s:s:{out_sub_idx}",
-                                  f"language={track['language']}"]
-                meta_args  += [f"-metadata:s:s:{out_sub_idx}",
-                               f"title={(track['title'] or 'Subtitles')} [{font_name}]"]
+        # Bind rewritten data files onto the processing map layout matrix
+        for track_meta, file_path in processed:
+            if track_meta["language"]:
+                cmd += ["--language", f"0:{track_meta['language']}"]
+            
+            # --- FIXED NAMING LOGIC ---
+            if track_name_override is not None:
+                final_track_name = track_name_override
             else:
-                # Image-based or failed extraction — stream-copy from original
-                cmd        += ["-map", f"0:{track['index']}"]
-                codec_args += [f"-c:s:{out_sub_idx}", "copy"]
+                # Keep the original track title exactly as it was without adding the font name suffix
+                final_track_name = track_meta["title"] or "English Subtitles"
+            # --------------------------
+            
+            cmd += ["--track-name", f"0:{final_track_name}"]
+            
+            def_flag = "yes" if track_meta["default"] == "1" else "no"
+            forc_flag = "yes" if track_meta["forced"] == "1" else "no"
+            cmd += ["--default-track-flag", f"0:{def_flag}"]
+            cmd += ["--forced-display-flag", f"0:{forc_flag}"]
+            
+            cmd += [str(file_path)]
 
-            out_sub_idx += 1
-
-        cmd += ["-c:v", "copy", "-c:a", "copy"]
-        cmd += codec_args + meta_args
-
-        # Preserve existing attachments from source (e.g. fonts already embedded)
-        cmd += ["-map", "0:t?"]
-
-        # Attach the new font.  Its output attachment index follows any that
-        # were preserved from the source, so we count those first.
-        n_existing = get_attachment_count(ffprobe, mkv_path)
-        mime = "font/otf" if font_file.suffix.lower() == ".otf" else "font/ttf"
+        # Attach custom target design font configuration file details
+        mime_type = "font/otf" if font_file.suffix.lower() == ".otf" else "font/ttf"
         cmd += [
-            "-attach", str(font_file),
-            f"-metadata:s:t:{n_existing}", f"mimetype={mime}",
-            f"-metadata:s:t:{n_existing}", f"filename={font_file.name}",
+            "--attachment-mime-type", mime_type,
+            "--attachment-name", font_file.name,
+            "--attach-file", str(font_file)
         ]
 
-        cmd += [str(out)]
+        print(f"  Remuxing video architecture container via mkvmerge...")
+        execution_status = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8")
 
-        print(f"  Remuxing + embedding font '{font_file.name}' (no video/audio re-encode)...")
-        result = subprocess.run(cmd, capture_output=True, text=True)
-
-        if result.returncode == 0 and out.exists():
-            in_mb  = mkv_path.stat().st_size / 1024 / 1024
-            out_mb = out.stat().st_size       / 1024 / 1024
-            print(f"  ✓ {out.name}  ({in_mb:.1f} MB → {out_mb:.1f} MB)\n")
+        if execution_status.returncode in (0, 1) and out.exists():
+            # Note: mkvmerge code 1 translates to completed execution steps but with minor non-fatal layout warnings
+            source_size = mkv_path.stat().st_size / 1024 / 1024
+            out_size = out.stat().st_size / 1024 / 1024
+            print(f"  ✓ Process Complete: {out.name} ({source_size:.1f} MB → {out_size:.1f} MB)\n")
         else:
-            print(f"  ✗ Failed!\n{result.stderr[-3000:]}\n")
+            print(f"  ✗ Process Interrupted! Error Log details:\n{execution_status.stdout[-2000:]}\n")
             out.unlink(missing_ok=True)
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
+# ── Runtime Wrapper Configuration entrypoint ─────────────────────────────────
 
 def run(args: list[str]) -> None:
     if not args:
-        print("Usage: python font.py <file_or_folder> [output_dir]")
+        print("Usage pattern validation error: python font.py <file_or_folder> [output_dir]")
         sys.exit(0)
 
-    ffmpeg  = find_ffmpeg()
-    ffprobe = find_ffprobe()
+    mkvmerge_bin = find_binary("mkvmerge")
+    mkvextract_bin = find_binary("mkvextract")
 
-    font_file = Path(FONT_FILE)
-    if not font_file.exists():
-        print(f"\n✗ Font file not found: {font_file}")
-        print("  Edit FONT_FILE in config.py to point to your .otf/.ttf file.")
+    # --- FIXED PATH RESOLUTION LOGIC ---
+    font_asset = Path(FONT_FILE)
+    if not font_asset.is_absolute() and not font_asset.exists():
+        # If not found in the current working directory, look inside the script's folder
+        script_relative = Path(__file__).parent / font_asset
+        if script_relative.exists():
+            font_asset = script_relative
+
+    if not font_asset.exists():
+        print(f"\n✗ Asset Configuration Error: Target path configuration absent: {FONT_FILE}")
+        print("  Update 'FONT_FILE' definition metrics inside your configuration script to mount font asset profiles.")
         sys.exit(1)
+    # ------------------------------------
 
-    # Use the module-level constant if set; fall back to reading the font binary.
-    font_name = FONT_NAME if FONT_NAME else get_font_name(font_file)
+    resolved_font_name = FONT_NAME if FONT_NAME else get_font_name(font_asset)
 
-    # ... rest of run() unchanged ...
-
-    print(f"\n🔤 Font changer")
-    print(f"   Font file : {font_file.name}")
-    print(f"   Font name : {font_name}")
-    print(f"   ffmpeg    : {ffmpeg}\n")
+    print(f"\n🔤 MKVToolNix Dynamic Font Swapper Engine Setup")
+    print(f"   Target Font File  : {font_asset.name}")
+    print(f"   Resolved Name Key : {resolved_font_name}")
+    print(f"   Override Track Name: {repr(SUBTITLE_TRACK_NAME) if SUBTITLE_TRACK_NAME is not None else 'None (using source)'}")
+    print(f"   mkvmerge Binary   : {mkvmerge_bin}")
+    print(f"   mkvextract Binary : {mkvextract_bin}\n")
 
     input_path = Path(args[0])
-    output_dir = Path(args[1]) if len(args) > 1 else None
+    output_directory = Path(args[1]) if len(args) > 1 else None
 
     if input_path.is_dir():
-        out = output_dir or (input_path / "font_changed")
+        out_target = output_directory or (input_path / "font_changed")
         files = (
             list(input_path.glob("*.mkv")) +
             list(input_path.glob("*.srt")) +
@@ -382,28 +454,28 @@ def run(args: list[str]) -> None:
             list(input_path.glob("*.ssa"))
         )
         if not files:
-            print(f"No MKV or subtitle files found in: {input_path}")
+            print(f"Data discovery validation failed: empty of matched target types at: {input_path}")
             return
-        print(f"Found {len(files)} file(s)\n")
+        print(f"Located {len(files)} operational targets for deployment.\n")
         for f in sorted(files):
-            print(f"▶ {f.name}")
+            print(f"▶ Processing Target Asset: {f.name}")
             if f.suffix.lower() == MKV_EXT:
-                process_mkv(f, out, font_name, font_file, ffmpeg, ffprobe)
+                process_mkv(f, out_target, resolved_font_name, font_asset, mkvmerge_bin, mkvextract_bin, SUBTITLE_TRACK_NAME)
             else:
-                process_subtitle(f, out, font_name)
+                process_subtitle(f, out_target, resolved_font_name)
 
     elif input_path.suffix.lower() == MKV_EXT:
-        out = output_dir or (input_path.parent / "font_changed")
-        print(f"▶ {input_path.name}")
-        process_mkv(input_path, out, font_name, font_file, ffmpeg, ffprobe)
+        out_target = output_directory or (input_path.parent / "font_changed")
+        print(f"▶ Processing Target Asset: {input_path.name}")
+        process_mkv(input_path, out_target, resolved_font_name, font_asset, mkvmerge_bin, mkvextract_bin, SUBTITLE_TRACK_NAME)
 
     elif input_path.suffix.lower() in SUB_EXTS:
-        out = output_dir or (input_path.parent / "font_changed")
-        print(f"▶ {input_path.name}")
-        process_subtitle(input_path, out, font_name)
+        out_target = output_directory or (input_path.parent / "font_changed")
+        print(f"▶ Processing Target Asset: {input_path.name}")
+        process_subtitle(input_path, out_target, resolved_font_name)
 
     else:
-        print(f"Unsupported file type: {input_path.suffix}")
+        print(f"Unsupported file format exception encountered on type extension profile: {input_path.suffix}")
         sys.exit(1)
 
 
