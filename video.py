@@ -59,6 +59,8 @@ def convert(input_path: Path, output_dir: Path) -> None:
         ffmpeg, "-y", "-i", str(input_path),
         "-vf", "scale=-2:720",          # downscale, keep aspect ratio
         "-c:v", "libx265",              # HEVC — best quality/size ratio
+        "-pix_fmt", "yuv420p",      # ← force 8-bit 4:2:0, prevents Pi green-screen
+        "-profile:v", "main",       # ← matches yuv420p 8-bit, max HW-decoder compat
         "-crf", str(VIDEO_CRF),
         "-preset", VIDEO_PRESET,
         "-tag:v", "hvc1",               # Apple/Jellyfin compatibility tag
