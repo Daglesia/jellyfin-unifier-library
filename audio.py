@@ -1,6 +1,7 @@
 # ── audio.py — audio inspection and re-encoding for Jellyfin MKVs ────────────
 # Default: stream-copy (no quality loss).
 # Optionally normalise volume or re-encode to AAC for client compatibility.
+# Audio track titles are always renamed to "Daglesia's Certified Audio [lang]".
 #
 # Called by main.py, or directly:
 #   python audio.py input.mkv  [output_dir] [--reencode] [--normalize]
@@ -21,6 +22,9 @@ AAC_BITRATE = "320k"   # 128k=small  192k=good  256k=excellent
 
 # loudnorm targets (EBU R128)
 LOUDNORM_TARGET = "I=-16:TP=-1.5:LRA=11"
+
+# Title stamped onto every audio track: "Daglesia's Certified Audio [eng]"
+TRACK_TITLE_PREFIX = "Daglesia's Certified Audio"
 
 
 # ── Audio track inspection ───────────────────────────────────────────────────
@@ -50,17 +54,53 @@ def get_audio_tracks(ffprobe: str, path: Path) -> list[dict]:
     return tracks
 
 
-def print_audio_info(path: Path, ffprobe: str) -> None:
-    tracks = get_audio_tracks(ffprobe, path)
+def print_audio_info(tracks: list[dict], name: str) -> None:
     if not tracks:
-        print(f"  ⚠ No audio tracks found in {path.name}")
+        print(f"  ⚠ No audio tracks found in {name}")
         return
-    print(f"  Audio tracks in {path.name}:")
+    print(f"  Audio tracks in {name}:")
     for t in tracks:
         ch_label = {"1": "mono", "2": "stereo", "6": "5.1", "8": "7.1"}.get(t["channels"], f"{t['channels']}ch")
         br = f"{int(t['bitrate'])//1000}k" if t["bitrate"].isdigit() else "?"
         print(f"    [{t['index']}] {t['codec']:8s}  {ch_label:8s}  {br:6s}  "
               f"lang={t['language'] or '?'}  title={t['title'] or '?'}")
+
+
+# ── Track title renaming ─────────────────────────────────────────────────────
+
+def resolve_language(track: dict, multiple: bool) -> str:
+    """
+    Return the language code to stamp into this track's new title.
+    Uses the ffprobe language tag when present. If it's missing and there's
+    more than one audio track (so we can't safely guess which is which),
+    ask the user to type it in. Single-track files with no tag fall back
+    to "und" instead of prompting.
+    """
+    lang = track["language"].strip()
+    if lang:
+        return lang
+    if multiple:
+        typed = input(
+            f"    Track [{track['index']}] ({track['codec']}, {track['channels']}ch) "
+            f"has no language tag — enter one (e.g. eng, jpn): "
+        ).strip()
+        return typed or "und"
+    return "und"
+
+
+def build_title_args(tracks: list[dict]) -> list[str]:
+    """
+    Build -metadata:s:a:N title=... args, one per audio track, renaming each
+    to "Daglesia's Certified Audio [lang]". N is the track's position among
+    audio streams (0-indexed), matching ffmpeg's s:a: stream specifier.
+    """
+    multiple = len(tracks) > 1
+    args = []
+    for i, t in enumerate(tracks):
+        lang = resolve_language(t, multiple)
+        title = f"{TRACK_TITLE_PREFIX} [{lang}]"
+        args += [f"-metadata:s:a:{i}", f"title={title}"]
+    return args
 
 
 # ── Two-pass loudnorm ────────────────────────────────────────────────────────
@@ -127,7 +167,14 @@ def process_mkv(
         print(f"  ↷ Skipping (output exists): {out.name}\n")
         return
 
-    print_audio_info(mkv_path, ffprobe)
+    tracks = get_audio_tracks(ffprobe, mkv_path)
+    print_audio_info(tracks, mkv_path.name)
+
+    if not tracks:
+        print(f"  ✗ No audio tracks — nothing to rename or process.\n")
+        return
+
+    title_args = build_title_args(tracks)
 
     cmd = [ffmpeg, "-y", "-i", str(mkv_path),
            "-map", "0",             # keep all streams
@@ -156,6 +203,7 @@ def process_mkv(
         print(f"  Audio: stream-copied (original codec preserved)")
         cmd += ["-c:a", "copy"]
 
+    cmd += title_args
     cmd += [str(out)]
 
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -208,7 +256,7 @@ def run(args: list[str]) -> None:
         for f in files:
             print(f"▶ {f.name}")
             if info_only:
-                print_audio_info(f, ffprobe)
+                print_audio_info(get_audio_tracks(ffprobe, f), f.name)
             else:
                 process_mkv(f, out, ffmpeg, ffprobe, reencode, normalize)
 
@@ -216,7 +264,7 @@ def run(args: list[str]) -> None:
         out = output_dir or (input_path.parent / "audio_out")
         print(f"▶ {input_path.name}")
         if info_only:
-            print_audio_info(input_path, ffprobe)
+            print_audio_info(get_audio_tracks(ffprobe, input_path), input_path.name)
         else:
             process_mkv(input_path, out, ffmpeg, ffprobe, reencode, normalize)
 
