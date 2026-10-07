@@ -7,7 +7,7 @@
 #
 # Two phases:
 #   1. ANALYSIS   - inspect every file, ask every question up front
-#                   (which English subtitle to keep, missing audio languages)
+#                   (which English/Polish subtitles to keep, missing audio languages)
 #   2. PROCESSING - run font -> audio -> video on every file with no prompts
 #
 # Only the final file is written to output_dir, named "Series Name S01E01.mkv".
@@ -125,12 +125,13 @@ def analyze_file(src: Path, opts: dict, ctx: dict | None, ffprobe: str) -> dict:
     """Ask every question this file will need and return the answers."""
     decisions: dict = {}
 
-    # Font step: which English subtitle track to keep (asks only if > 1)
+    # Font step: which English/Polish subtitle tracks to keep
+    # (asks only when a language has more than one track)
     if "font" in opts["steps"] and src.suffix.lower() == ".mkv":
         sub_tracks = read_subtitle_tracks(ctx["mkvmerge"], src)
         if sub_tracks:
-            keep = font.select_english_subtitle(sub_tracks)
-            decisions["sub_id"] = keep["id"] if keep else None
+            chosen = font.select_subtitles(sub_tracks)
+            decisions["sub_ids"] = [t["id"] for _, t in chosen]
 
     # Audio step: language for tracks with no tag (asks only if untagged + multiple)
     if "audio" in opts["steps"]:
@@ -147,27 +148,32 @@ def apply_decisions(decisions: dict):
     Swap the interactive helpers in font.py / audio.py for lookups of the
     answers collected during analysis, so processing never prompts.
     """
-    orig_select = font.select_english_subtitle
+    orig_select = font.select_subtitles
     orig_titles = audio.build_title_args
 
     def select(tracks):
-        sid = decisions.get("sub_id")
-        if sid is not None:
+        ids = decisions.get("sub_ids")
+        if ids is None:
+            return orig_select(tracks)          # nothing recorded -> normal behaviour
+
+        picked = []
+        for label, tags in font.KEEP_LANGS:     # keep English-first ordering
             for t in tracks:
-                if t["id"] == sid:
-                    return t
-        return orig_select(tracks)
+                if t["id"] in ids and font.lang_base(t["language"]) in tags:
+                    picked.append((label, t))
+                    break
+        return picked                           # [] = no subs, same as analysis
 
     def titles(tracks):
         args = decisions.get("audio_args")
         return args if args is not None else orig_titles(tracks)
 
-    font.select_english_subtitle = select
+    font.select_subtitles = select
     audio.build_title_args = titles
     try:
         yield
     finally:
-        font.select_english_subtitle = orig_select
+        font.select_subtitles = orig_select
         audio.build_title_args = orig_titles
 
 
