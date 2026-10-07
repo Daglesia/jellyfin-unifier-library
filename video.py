@@ -6,7 +6,7 @@
 import subprocess
 import sys
 from pathlib import Path
-from config import find_ffmpeg, find_ffprobe, VIDEO_CRF, VIDEO_PRESET
+from config import find_ffmpeg, find_ffprobe, VIDEO_CRF, VIDEO_PRESET, VIDEO_TRACK_TITLE
 
 VIDEO_EXTS = {".mkv", ".mp4", ".avi", ".mov", ".ts", ".m2ts", ".wmv"}
 
@@ -46,37 +46,53 @@ def convert(input_path: Path, output_dir: Path) -> None:
     codec   = info["codec"]
     is_hevc = codec in {"hevc", "h265"}
 
-    if height > 0 and height <= 720 and is_hevc:
-        print(f"  ↷ Skipping {input_path.name} — already {height}p HEVC\n")
-        return
-    elif height > 0 and height <= 720 and not is_hevc:
-        print(f"  ↷ Re-encoding {input_path.name} — {height}p but codec is {codec}, converting to HEVC\n")
-    elif height > 720 and is_hevc:
-        print(f"  Downscaling {input_path.name} — already HEVC but {height}p, downscaling to 720p\n")
-    # else: >720p + non-HEVC — normal encode path, label printed below
+    # Already 720p-or-smaller HEVC: no re-encode needed, just a lossless remux
+    # so the video track still gets renamed.
+    remux_only = height > 0 and height <= 720 and is_hevc
 
-    cmd = [
-        ffmpeg, "-y", "-i", str(input_path),
-        "-vf", "scale=-2:720",          # downscale, keep aspect ratio
-        "-c:v", "libx265",              # HEVC — best quality/size ratio
-        "-pix_fmt", "yuv420p",      # ← force 8-bit 4:2:0, prevents Pi green-screen
-        "-profile:v", "main",       # ← matches yuv420p 8-bit, max HW-decoder compat
-        "-crf", str(VIDEO_CRF),
-        "-preset", VIDEO_PRESET,
-        "-tag:v", "hvc1",               # Apple/Jellyfin compatibility tag
-        "-c:a", "copy",                 # audio passthrough — NO re-encode
-        "-map", "0",                    # keep all streams (audio, subs, chapters)
-        "-c:s", "copy",                 # copy subtitles as-is
-        str(out),
-    ]
-
-    if height > 720:
-        label = f"{height}p → 720p"
+    if remux_only:
+        print(f"  Remuxing {input_path.name} — already {height}p HEVC, "
+              f"video stream-copied, only renaming the track\n")
+        cmd = [
+            ffmpeg, "-y", "-i", str(input_path),
+            "-map", "0",
+            "-c", "copy",                   # everything stream-copied
+            "-metadata:s:v:0", f"title={VIDEO_TRACK_TITLE}",
+            str(out),
+        ]
+        label = f"{height}p HEVC (remux, no re-encode)"
+        print(f"  Video track title: {VIDEO_TRACK_TITLE}\n")
     else:
-        label = f"{height}p {codec} → 720p HEVC"
+        if height > 0 and height <= 720 and not is_hevc:
+            print(f"  ↷ Re-encoding {input_path.name} — {height}p but codec is {codec}, converting to HEVC\n")
+        elif height > 720 and is_hevc:
+            print(f"  Downscaling {input_path.name} — already HEVC but {height}p, downscaling to 720p\n")
+        # else: >720p + non-HEVC — normal encode path, label printed below
 
-    print(f"  Encoding ({label})  crf={VIDEO_CRF}  preset={VIDEO_PRESET}")
-    print(f"  Audio: stream-copied (no quality loss)\n")
+        cmd = [
+            ffmpeg, "-y", "-i", str(input_path),
+            "-vf", "scale=-2:720",          # downscale, keep aspect ratio
+            "-c:v", "libx265",              # HEVC — best quality/size ratio
+            "-pix_fmt", "yuv420p",      # ← force 8-bit 4:2:0, prevents Pi green-screen
+            "-profile:v", "main",       # ← matches yuv420p 8-bit, max HW-decoder compat
+            "-crf", str(VIDEO_CRF),
+            "-preset", VIDEO_PRESET,
+            "-tag:v", "hvc1",               # Apple/Jellyfin compatibility tag
+            "-metadata:s:v:0", f"title={VIDEO_TRACK_TITLE}",   # rename first video track
+            "-c:a", "copy",                 # audio passthrough — NO re-encode
+            "-map", "0",                    # keep all streams (audio, subs, chapters)
+            "-c:s", "copy",                 # copy subtitles as-is
+            str(out),
+        ]
+
+        if height > 720:
+            label = f"{height}p → 720p"
+        else:
+            label = f"{height}p {codec} → 720p HEVC"
+
+        print(f"  Encoding ({label})  crf={VIDEO_CRF}  preset={VIDEO_PRESET}")
+        print(f"  Video track title: {VIDEO_TRACK_TITLE}")
+        print(f"  Audio: stream-copied (no quality loss)\n")
 
     result = subprocess.run(cmd)
     if result.returncode == 0 and out.exists():
@@ -85,7 +101,7 @@ def convert(input_path: Path, output_dir: Path) -> None:
         saved  = 100 * (1 - out_mb / in_mb)
         print(f"  ✓ {input_path.name}  {in_mb:.1f} MB → {out_mb:.1f} MB  ({saved:.0f}% smaller)\n")
     else:
-        print(f"  ✗ Failed: {input_path.name}\n")
+        print(f"  ✗ Failed ({label}): {input_path.name}\n")
         out.unlink(missing_ok=True)
 
 

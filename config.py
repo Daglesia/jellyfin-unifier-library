@@ -11,6 +11,8 @@ FFPROBE_PATH = r""
 # Full path to your .otf or .ttf font file (used by the font utility)
 FONT_FILE = "./Rosario-Regular.ttf"
 
+VIDEO_TRACK_TITLE = "Wideło officiale [720p]"
+
 SUBTITLE_TRACK_NAMES = {
     "English": "Daglesia's Subuwutitles [English]",
     "Polish":  "Daglesia's Subuwutitles [Polish]",
