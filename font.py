@@ -1,5 +1,11 @@
 # ── font.py ──────────────────────────────────────────────────────────────────
 # Change the primary subtitle font in MKV or standalone .srt/.ass files using MKVToolNix
+#
+# Subtitle retention rules for MKV files:
+#   English only        -> keep English
+#   English + Polish    -> keep both (English first / default)
+#   Polish only         -> keep Polish
+#   Neither             -> no subtitles in the output
 
 import re
 import subprocess
@@ -14,6 +20,7 @@ from collections import Counter
 FONT_FILE = "sub_font.ttf"
 FONT_NAME = None
 SUBTITLE_TRACK_NAME = None
+SUBTITLE_TRACK_NAMES = {}   # optional per-language names, e.g. {"English": "...", "Polish": "..."}
 
 # Import defaults individually to prevent a partial config from breaking the script
 try:
@@ -21,6 +28,7 @@ try:
     FONT_FILE = getattr(config, "FONT_FILE", FONT_FILE)
     FONT_NAME = getattr(config, "FONT_NAME", FONT_NAME)
     SUBTITLE_TRACK_NAME = getattr(config, "SUBTITLE_TRACK_NAME", SUBTITLE_TRACK_NAME)
+    SUBTITLE_TRACK_NAMES = getattr(config, "SUBTITLE_TRACK_NAMES", SUBTITLE_TRACK_NAMES)
 except ImportError:
     pass  # Fall back smoothly to defaults if config.py is completely missing
 
@@ -31,8 +39,12 @@ MKV_EXT = ".mkv"
 # MKVMerge identification strings for text-based subtitle systems
 TEXT_CODECS = {"substationalpha", "subrip/srt", "webvtt", "text/utf8"}
 
-# Language tags treated as "English" (both ISO 639-2 and 639-1 forms show up)
-ENGLISH_TAGS = {"eng", "en"}
+# Languages to keep, in output order (the first one found becomes the default track).
+# Each entry: (display label, accepted language tags)
+KEEP_LANGS = [
+    ("English", {"eng", "en"}),
+    ("Polish",  {"pol", "pl"}),
+]
 
 
 # ── Binary Finders (MKVToolNix) ──────────────────────────────────────────────
@@ -203,10 +215,12 @@ def replace_ass_font(ass_path: Path, font_name: str) -> str:
                         out_lines.append(line)
                 else:
                     out_lines.append(line)
+            else:
+                out_lines.append(line)
         else:
             # Inline execution sweep matching specifically text instances matching old target layout structures
             escaped_old = re.escape(old_font)
-            modified_line = re.sub(r"\\fn" + escaped_old + r"(?=[}\\])", f"\\\\fn{font_name}", line, flags=re.IGNORECASE)
+            modified_line = re.sub(r"\\fn" + escaped_old + r"(?=[}\\])", lambda m: f"\\fn{font_name}", line, flags=re.IGNORECASE)
             out_lines.append(modified_line)
 
     return "\n".join(out_lines) + "\n"
@@ -241,8 +255,8 @@ def srt_to_ass(srt_path: Path, font_name: str) -> str:
         t = t.replace(",", ".")
         h, m, rest = t.split(":")
         s, ms = rest.split(".")
-        cs = str(round(int(ms) / 10)).zfill(2)[:2]
-        return f"{int(h)}:{m}:{s}.{cs}"
+        cs = min(round(int(ms) / 10), 99)
+        return f"{int(h)}:{m}:{s}.{cs:02d}"
 
     lines_out = []
     blocks = re.split(r"\n\s*\n", srt_path.read_text(encoding="utf-8-sig", errors="replace").strip())
@@ -260,28 +274,58 @@ def srt_to_ass(srt_path: Path, font_name: str) -> str:
     return header + "\n".join(lines_out) + "\n"
 
 
-# ── English subtitle selection ────────────────────────────────────────────────
+# ── Subtitle selection (English and/or Polish) ───────────────────────────────
+
+def lang_base(code: str) -> str:
+    """'en-US' -> 'en', 'POL' -> 'pol'."""
+    return (code or "").lower().split("-")[0]
+
+
+def select_subtitles(sub_tracks: list[dict]) -> list[tuple[str, dict]]:
+    """
+    Return [(label, track), ...] for the languages in KEEP_LANGS that exist
+    in the file, in KEEP_LANGS order. Prompts when a language has more than
+    one track.
+    """
+    chosen = []
+    for label, tags in KEEP_LANGS:
+        matches = [t for t in sub_tracks if lang_base(t["language"]) in tags]
+        if not matches:
+            continue
+        if len(matches) == 1:
+            chosen.append((label, matches[0]))
+            continue
+
+        print(f"  Multiple {label} subtitle tracks found:")
+        for i, t in enumerate(matches, 1):
+            print(f"    {i}. id={t['id']}  codec={t['codec']}  title={t['title'] or '?'}")
+        while True:
+            choice = input(f"  Which {label} one to keep [1-{len(matches)}]: ").strip()
+            if choice.isdigit() and 1 <= int(choice) <= len(matches):
+                chosen.append((label, matches[int(choice) - 1]))
+                break
+            print("  Invalid choice, try again.")
+    return chosen
+
+
+# ── Backward-compatibility shims (for pipeline.py and other callers) ─────────
+
+ENGLISH_TAGS = KEEP_LANGS[0][1]
+
 
 def select_english_subtitle(sub_tracks: list[dict]) -> dict | None:
     """
-    Return the single subtitle track dict to keep, or None if no English
-    track exists. Prompts the user when more than one English track is found.
+    Legacy single-track API: returns the first kept track (English if present,
+    else Polish), or None. Callers that can handle several tracks should use
+    select_subtitles() instead so Polish is kept alongside English.
     """
-    english = [t for t in sub_tracks if t["language"].lower() in ENGLISH_TAGS]
+    chosen = select_subtitles(sub_tracks)
+    return chosen[0][1] if chosen else None
 
-    if not english:
-        return None
-    if len(english) == 1:
-        return english[0]
 
-    print("  Multiple English subtitle tracks found:")
-    for i, t in enumerate(english, 1):
-        print(f"    {i}. id={t['id']}  codec={t['codec']}  title={t['title'] or '?'}")
-    while True:
-        choice = input(f"  Which one to keep [1-{len(english)}]: ").strip()
-        if choice.isdigit() and 1 <= int(choice) <= len(english):
-            return english[int(choice) - 1]
-        print("  Invalid choice, try again.")
+def track_name_override_for(label: str, global_override: str | None) -> str | None:
+    """Per-language name wins, then the global SUBTITLE_TRACK_NAME, else None."""
+    return SUBTITLE_TRACK_NAMES.get(label) or global_override
 
 
 # ── Main processing endpoints ───────────────────────────────────────────────
@@ -341,129 +385,112 @@ def process_mkv(mkv_path: Path, output_dir: Path, font_name: str, font_file: Pat
             })
 
     if not sub_tracks:
-        print(f"  ⚠ Dynamic mapping empty of layout track text streams — duplicating standard container layout.\n")
+        print(f"  ⚠ No subtitle tracks found — copying container as-is.\n")
         shutil.copy2(mkv_path, out)
         return
 
-    print(f"  Discovered {len(sub_tracks)} subtitle element channels:")
+    print(f"  Discovered {len(sub_tracks)} subtitle track(s):")
     for st in sub_tracks:
         print(f"    [{st['id']}] {st['codec']:22s} lang={st['language'] or '?'} title={st['title'] or '?'}")
 
-    # ── Keep only English, prompt if there's more than one ────────────────────
-    keep_track = select_english_subtitle(sub_tracks)
+    mime_type = "font/otf" if font_file.suffix.lower() == ".otf" else "font/ttf"
+    font_args = [
+        "--attachment-mime-type", mime_type,
+        "--attachment-name", font_file.name,
+        "--attach-file", str(font_file),
+    ]
 
-    if keep_track is None:
-        print(f"  ⚠ No English subtitle track found — output will have no subtitles.")
-        cmd = [mkvmerge, "-o", str(out), "-S", str(mkv_path)]
-        mime_type = "font/otf" if font_file.suffix.lower() == ".otf" else "font/ttf"
-        cmd += [
-            "--attachment-mime-type", mime_type,
-            "--attachment-name", font_file.name,
-            "--attach-file", str(font_file)
-        ]
-        print(f"  Remuxing (subtitles stripped) via mkvmerge...")
-        execution_status = subprocess.run(
+    def finish(cmd: list[str]) -> None:
+        print(f"  Remuxing via mkvmerge...")
+        status = subprocess.run(
             cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
         )
-        if execution_status.returncode in (0, 1) and out.exists():
-            source_size = mkv_path.stat().st_size / 1024 / 1024
-            out_size = out.stat().st_size / 1024 / 1024
-            print(f"  ✓ Process Complete: {out.name} ({source_size:.1f} MB → {out_size:.1f} MB)\n")
+        # mkvmerge exit code 1 = finished with non-fatal warnings
+        if status.returncode in (0, 1) and out.exists():
+            src_mb = mkv_path.stat().st_size / 1024 / 1024
+            out_mb = out.stat().st_size / 1024 / 1024
+            print(f"  ✓ Process Complete: {out.name} ({src_mb:.1f} MB → {out_mb:.1f} MB)\n")
         else:
-            print(f"  ✗ Process Interrupted! Error Log details:\n{execution_status.stdout[-2000:]}\n")
+            print(f"  ✗ Process Interrupted! Error Log details:\n{status.stdout[-2000:]}\n")
             out.unlink(missing_ok=True)
+
+    # ── Pick English and/or Polish ────────────────────────────────────────────
+    chosen = select_subtitles(sub_tracks)
+
+    if not chosen:
+        print(f"  ⚠ No English or Polish subtitle track found — output will have no subtitles.")
+        finish([mkvmerge, "-o", str(out), "-S", str(mkv_path)] + font_args)
         return
 
-    dropped = len(sub_tracks) - 1
-    if dropped:
-        print(f"  Keeping only track [{keep_track['id']}] (English) — dropping {dropped} other track(s)")
+    kept_labels = " + ".join(label for label, _ in chosen)
+    dropped = len(sub_tracks) - len(chosen)
+    print(f"  Keeping: {kept_labels} — dropping {dropped} other track(s)")
 
-    codec_lower = keep_track["codec"].lower()
-    if codec_lower not in TEXT_CODECS:
-        print(f"  ⚠ Chosen English track is image-based ({keep_track['codec']}) — cannot rewrite font, copying as-is.")
+    # First kept track (English if present, else Polish) is the default
+    default_id = chosen[0][1]["id"]
 
     with tempfile.TemporaryDirectory() as temp_dir:
         tmp = Path(temp_dir)
-        processed = []
-        processed_ids = set()
+        rewritten = []        # (label, track_meta, rewritten_ass_path)
+        passthrough = []      # (label, track_meta): image-based or failed extractions, keep original
 
-        if codec_lower in TEXT_CODECS:
+        for label, track in chosen:
+            codec_lower = track["codec"].lower()
+
+            if codec_lower not in TEXT_CODECS:
+                print(f"  ⚠ {label} track [{track['id']}] is image-based ({track['codec']}) — keeping as-is.")
+                passthrough.append((label, track))
+                continue
+
             src_ext = ".ass" if "substationalpha" in codec_lower else ".srt"
-            raw_extracted = tmp / f"track_{keep_track['id']}{src_ext}"
+            raw = tmp / f"track_{track['id']}{src_ext}"
 
-            print(f"  Extracting subtitle map stream [{keep_track['id']}]...")
+            print(f"  Extracting {label} subtitle track [{track['id']}]...")
             subprocess.run(
-                [mkvextract, "tracks", str(mkv_path), f"{keep_track['id']}:{str(raw_extracted)}"],
+                [mkvextract, "tracks", str(mkv_path), f"{track['id']}:{raw}"],
                 capture_output=True, text=True, encoding="utf-8", errors="replace",
             )
 
-            if raw_extracted.exists() and raw_extracted.stat().st_size > 0:
-                rewritten_ass = tmp / f"track_{keep_track['id']}_modified.ass"
-                content = (srt_to_ass(raw_extracted, font_name) if src_ext == ".srt"
-                           else replace_ass_font(raw_extracted, font_name))
-
-                rewritten_ass.write_text(content, encoding="utf-8")
-                processed.append((keep_track, rewritten_ass))
-                processed_ids.add(keep_track["id"])
+            if raw.exists() and raw.stat().st_size > 0:
+                content = (srt_to_ass(raw, font_name) if src_ext == ".srt"
+                           else replace_ass_font(raw, font_name))
+                new_file = tmp / f"track_{track['id']}_modified.ass"
+                new_file.write_text(content, encoding="utf-8")
+                rewritten.append((label, track, new_file))
             else:
-                print(f"    ⚠ Extraction profile blank — bypass rewriting on element thread.")
+                print(f"    ⚠ Extraction empty — keeping original {label} track unmodified.")
+                passthrough.append((label, track))
 
-        # Build structural mapping chain definitions for MKVMerge engine remux execution
+        # ── Build mkvmerge command ────────────────────────────────────────────
         cmd = [mkvmerge, "-o", str(out)]
 
-        if processed:
-            # Strip every subtitle track except the one we're re-inserting rewritten
-            other_ids = [str(st["id"]) for st in sub_tracks if st["id"] != keep_track["id"]]
-            cmd += (["-s", ",".join(other_ids)] if other_ids else []) + ["-S"] if not other_ids else cmd
-            # Simpler & correct: strip ALL originals, we re-attach the rewritten one as a new track
-            cmd = [mkvmerge, "-o", str(out), "-S", str(mkv_path)]
-
-            for track_meta, file_path in processed:
-                if track_meta["language"]:
-                    cmd += ["--language", f"0:{track_meta['language']}"]
-
-                if track_name_override is not None:
-                    final_track_name = track_name_override
-                else:
-                    final_track_name = track_meta["title"] or "English Subtitles"
-
-                cmd += ["--track-name", f"0:{final_track_name}"]
-
-                def_flag = "yes" if track_meta["default"] == "1" else "no"
-                forc_flag = "yes" if track_meta["forced"] == "1" else "no"
-                cmd += ["--default-track-flag", f"0:{def_flag}"]
-                cmd += ["--forced-display-flag", f"0:{forc_flag}"]
-
-                cmd += [str(file_path)]
+        # Source file: keep only the passthrough subtitle tracks (or none at all)
+        if passthrough:
+            cmd += ["-s", ",".join(str(t["id"]) for _, t in passthrough)]
+            for _, t in passthrough:
+                cmd += ["--default-track-flag", f"{t['id']}:{'yes' if t['id'] == default_id else 'no'}"]
         else:
-            # Image-based English track (or extraction failed) — keep only that
-            # original track, strip everything else, no rewritten file to add.
-            other_ids = [str(st["id"]) for st in sub_tracks if st["id"] != keep_track["id"]]
-            if other_ids:
-                cmd += ["-s", str(keep_track["id"])]
-            cmd += [str(mkv_path)]
+            cmd += ["-S"]
+        cmd += [str(mkv_path)]
 
-        # Attach custom target design font configuration file details
-        mime_type = "font/otf" if font_file.suffix.lower() == ".otf" else "font/ttf"
-        cmd += [
-            "--attachment-mime-type", mime_type,
-            "--attachment-name", font_file.name,
-            "--attach-file", str(font_file)
-        ]
+        # Rewritten tracks, added as separate inputs
+        for label, track, file_path in rewritten:
+            if track["language"]:
+                cmd += ["--language", f"0:{track['language']}"]
 
-        print(f"  Remuxing video architecture container via mkvmerge...")
-        execution_status = subprocess.run(
-            cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
-        )
+            name = (
+                track_name_override_for(label, track_name_override)
+                or track["title"]
+                or f"{label} Subtitles"
+            )
+            cmd += ["--track-name", f"0:{name}"]
+            cmd += ["--default-track-flag", f"0:{'yes' if track['id'] == default_id else 'no'}"]
+            cmd += ["--forced-display-flag", f"0:{'yes' if track['forced'] == '1' else 'no'}"]
+            cmd += [str(file_path)]
 
-        if execution_status.returncode in (0, 1) and out.exists():
-            # Note: mkvmerge code 1 translates to completed execution steps but with minor non-fatal layout warnings
-            source_size = mkv_path.stat().st_size / 1024 / 1024
-            out_size = out.stat().st_size / 1024 / 1024
-            print(f"  ✓ Process Complete: {out.name} ({source_size:.1f} MB → {out_size:.1f} MB)\n")
-        else:
-            print(f"  ✗ Process Interrupted! Error Log details:\n{execution_status.stdout[-2000:]}\n")
-            out.unlink(missing_ok=True)
+        # Attach custom target design font configuration file
+        cmd += font_args
+        finish(cmd)
 
 
 # ── Runtime Wrapper Configuration entrypoint ─────────────────────────────────
@@ -476,10 +503,9 @@ def run(args: list[str]) -> None:
     mkvmerge_bin = find_binary("mkvmerge")
     mkvextract_bin = find_binary("mkvextract")
 
-    # --- FIXED PATH RESOLUTION LOGIC ---
+    # If not found in the current working directory, look inside the script's folder
     font_asset = Path(FONT_FILE)
     if not font_asset.is_absolute() and not font_asset.exists():
-        # If not found in the current working directory, look inside the script's folder
         script_relative = Path(__file__).parent / font_asset
         if script_relative.exists():
             font_asset = script_relative
@@ -488,14 +514,15 @@ def run(args: list[str]) -> None:
         print(f"\n✗ Asset Configuration Error: Target path configuration absent: {FONT_FILE}")
         print("  Update 'FONT_FILE' definition metrics inside your configuration script to mount font asset profiles.")
         sys.exit(1)
-    # ------------------------------------
 
     resolved_font_name = FONT_NAME if FONT_NAME else get_font_name(font_asset)
 
     print(f"\n🔤 MKVToolNix Dynamic Font Swapper Engine Setup")
     print(f"   Target Font File  : {font_asset.name}")
     print(f"   Resolved Name Key : {resolved_font_name}")
+    print(f"   Keep Languages    : {', '.join(label for label, _ in KEEP_LANGS)}")
     print(f"   Override Track Name: {repr(SUBTITLE_TRACK_NAME) if SUBTITLE_TRACK_NAME is not None else 'None (using source)'}")
+    print(f"   Per-language Names: {SUBTITLE_TRACK_NAMES or 'None'}")
     print(f"   mkvmerge Binary   : {mkvmerge_bin}")
     print(f"   mkvextract Binary : {mkvextract_bin}\n")
 
